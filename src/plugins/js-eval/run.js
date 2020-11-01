@@ -4,7 +4,7 @@ const builtinModules = require('module').builtinModules.filter(
   (a) => !/^_|\//.test(a),
 );
 
-let runWithEngine262; // cached function, initialized lazily below in run()
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // copied from https://github.com/devsnek/docker-js-eval/run.js
 
@@ -22,77 +22,120 @@ const inspect = (val) => {
   }
 };
 
-const run = async (code, environment, timeout) => {
-  if (environment === 'node-cjs') {
-    const script = new Script(code);
-    global.module = module;
-    global.require = require;
-    global.exports = exports;
-    global.__dirname = __dirname;
-    global.__filename = __filename;
-    for (const name of builtinModules) {
-      const setReal = (val) => {
-        delete global[name];
-        global[name] = val;
-      };
+function exposeBuiltinInGlobal(name) {
+  const require2 = require;
+  const setReal = (val) => {
+    delete global[name];
+    global[name] = val;
+  };
+  Object.defineProperty(global, name, {
+    get: () => {
+      const value = require2(name); // eslint-disable-line
+      delete global[name];
       Object.defineProperty(global, name, {
-        get: () => {
-          const lib = require(name); // eslint-disable-line
-          delete global[name];
-          Object.defineProperty(global, name, {
-            get: () => lib,
-            set: setReal,
-            configurable: true,
-            enumerable: false,
-          });
-          return lib;
-        },
+        get: () => value,
         set: setReal,
         configurable: true,
         enumerable: false,
       });
-    }
-    return script.runInThisContext({
-      timeout,
-      displayErrors: true,
-    });
-  }
-  if (environment === 'module') {
-    const module = new SourceTextModule(code, {
-      context: createContext(Object.create(null)),
-    });
-    await module.link(async () => {
-      throw new Error('Unable to resolve import');
-    });
-    module.instantiate();
-    const { result } = await module.evaluate({ timeout });
-    return result;
-  }
-  if (environment === 'script') {
-    const script = new Script(code, {
-      displayErrors: true,
-    });
-    return script.runInContext(createContext(Object.create(null)), {
-      timeout,
-      displayErrors: true,
-    });
-  }
-  if (environment === 'engine262') {
-    if (!runWithEngine262) {
-      const { Realm, initializeAgent, FEATURES, inspect } = require('engine262');
+      return value;
+    },
+    set: setReal,
+    configurable: true,
+    enumerable: false,
+  });
+}
 
-      initializeAgent({
-        features: FEATURES.map((o) => o.name),
+const run = async (code, environment, timeout) => {
+  switch (environment) {
+    case 'node-cjs': {
+      const script = new Script(code);
+      global.module = module;
+      global.require = require;
+      global.exports = exports;
+      global.__dirname = __dirname;
+      global.__filename = __filename;
+      builtinModules.forEach(exposeBuiltinInGlobal);
+      const result = await script.runInThisContext({
+        timeout,
+        displayErrors: true,
+      });
+      return inspect(result);
+    }
+
+    case 'module': {
+      const module = new SourceTextModule(code, {
+        context: createContext(Object.create(null)),
+      });
+      await module.link(async () => {
+        throw new Error('Unable to resolve import');
       });
 
-      const realm = new Realm();
+      const [error, result] = await Promise.race([
+        module.evaluate({ timeout }).then((r) => [null, r]),
+        delay(Math.floor(timeout * 1.5)).then(() => [
+          new Error('The execution timed out'),
+          null,
+        ]),
+      ]);
 
-      runWithEngine262 = (code) => inspect(realm.evaluateScript(code), realm);
+      if (error) {
+        throw error;
+      }
+
+      return inspect(result);
     }
-    return runWithEngine262(code);
-  }
 
-  throw new RangeError(`Invalid environment: ${environment}`);
+    case 'script': {
+      const script = new Script(code, {
+        displayErrors: true,
+      });
+      const result = await script.runInContext(createContext(Object.create(null)), {
+        timeout,
+        displayErrors: true,
+      });
+      return inspect(result);
+    }
+
+    case 'engine262': {
+      const {
+        Agent,
+        ManagedRealm,
+        Value,
+        CreateDataProperty,
+        FEATURES,
+        setSurroundingAgent,
+        inspect: _inspect,
+      } = require('engine262'); // eslint-disable-line
+
+      const agent = new Agent({
+        features: FEATURES.map((o) => o.name),
+      });
+      setSurroundingAgent(agent);
+
+      const realm = new ManagedRealm();
+
+      return new Promise((resolve, reject) => {
+        realm.scope(() => {
+          const print = new Value((args) => {
+            console.log(...args.map((tmp) => _inspect(tmp)));
+            return Value.undefined;
+          });
+          CreateDataProperty(realm.GlobalObject, new Value('print'), print);
+
+          const completion = realm.evaluateScript(code);
+          if (completion.Type === 'throw') {
+            reject(_inspect(completion.Value));
+          } else {
+            resolve(_inspect(completion.Value));
+          }
+        });
+      });
+    }
+
+    default:
+      throw new RangeError(`Invalid environment: ${environment}`);
+  }
 };
 
 if (!module.parent) {
@@ -106,12 +149,13 @@ if (!module.parent) {
       }
     }
     try {
-      const result = await run(
+      const output = await run(
         code,
         process.env.JSEVAL_ENV,
         Number.parseInt(process.env.JSEVAL_TIMEOUT, 10) || undefined,
       );
-      process.stdout.write(inspect(result));
+      process.stdout.write('⬊ ');
+      process.stdout.write(output);
     } catch (error) {
       process.stdout.write(
         error instanceof Error ? `${error.name}: ${error.message}` : `${error}`,
